@@ -1,0 +1,106 @@
+param(
+    [int]$MaxResults = 20,
+    [string]$FolderPath = "Inbox",
+    [switch]$UnreadOnly,
+    [string]$SubjectContains,
+    [string]$SenderContains,
+    [string]$OutputJson
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+function Get-OutlookFolder {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Namespace,
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $parts = $Path -split "[\\/]" | Where-Object { $_.Trim().Length -gt 0 }
+    if ($parts.Count -eq 0) {
+        throw "FolderPath cannot be empty."
+    }
+
+    $folder = $null
+    $firstPart = $parts[0]
+
+    try {
+        $folder = $Namespace.Folders.Item($firstPart)
+        $startIndex = 1
+    } catch {
+        $folder = $Namespace.GetDefaultFolder(6)
+        if ($firstPart -ne "Inbox") {
+            $folder = $folder.Folders.Item($firstPart)
+        }
+        $startIndex = 1
+    }
+
+    for ($i = $startIndex; $i -lt $parts.Count; $i++) {
+        $folder = $folder.Folders.Item($parts[$i])
+    }
+
+    return $folder
+}
+
+try {
+    $outlook = New-Object -ComObject Outlook.Application
+    $namespace = $outlook.GetNamespace("MAPI")
+    $folder = Get-OutlookFolder -Namespace $namespace -Path $FolderPath
+
+    $items = $folder.Items
+    $items.Sort("[ReceivedTime]", $true)
+
+    $results = New-Object System.Collections.Generic.List[object]
+
+    foreach ($item in $items) {
+        if ($results.Count -ge $MaxResults) {
+            break
+        }
+
+        if (-not ($item -is [__ComObject])) {
+            continue
+        }
+
+        try {
+            if ($item.MessageClass -notlike "IPM.Note*") {
+                continue
+            }
+
+            if ($UnreadOnly -and -not $item.UnRead) {
+                continue
+            }
+
+            if ($SubjectContains -and ($item.Subject -notlike "*$SubjectContains*")) {
+                continue
+            }
+
+            if ($SenderContains -and ($item.SenderName -notlike "*$SenderContains*")) {
+                continue
+            }
+
+            $results.Add([PSCustomObject]@{
+                Subject      = $item.Subject
+                Sender       = $item.SenderName
+                SenderEmail  = $item.SenderEmailAddress
+                ReceivedTime = $item.ReceivedTime
+                Unread       = $item.UnRead
+                SizeBytes    = $item.Size
+                EntryId      = $item.EntryID
+            })
+        } catch {
+            continue
+        }
+    }
+
+    if ($OutputJson) {
+        $results | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $OutputJson -Encoding UTF8
+        Write-Host "Saved $($results.Count) mail item(s) to $OutputJson"
+    } else {
+        $results | Format-Table -AutoSize
+    }
+} catch {
+    Write-Error "Failed to read Outlook mail: $($_.Exception.Message)"
+    exit 1
+}
