@@ -1,121 +1,160 @@
-import os
+import re
+import time
+import datetime
+import win32com.client
 from playwright.sync_api import Playwright, sync_playwright
-from dotenv import load_dotenv
 
-# Loads ICRA_USER_ID / ICRA_USER_PWD from a local .env file
-# (never commit the .env file to git)
-load_dotenv()
+# =========================
+# ? Outlook OTP Fetch
+# =========================
 
-USER_ID = os.environ["ICRA_USER_ID"]
-USER_PWD = os.environ["ICRA_USER_PWD"]
+def mark_read():
+    outlook = win32com.client.Dispatch("Outlook.Application")
+    namespace = outlook.GetNamespace("MAPI")
+    inbox = namespace.GetDefaultFolder(6)  # Inbox
 
-# ---------------------------------------------------------
-# Everything that changes between runs lives here.
-# Add/remove a category -> nothing else in the script changes.
-# ---------------------------------------------------------
-SEARCH_TERM = "gold"          # typed into the "Select User Set" search box
-REPORT_LINK_NAME = "Gold"     # the fund-group link/report to open
-SCHEME_CATEGORIES = [
-    "Gold ETF_Peer",
-    "Gold ETF_Tracker",
-    "Gold FOF_Peer",
-    "Gold FOF_Tracker",
-    # "Gold ETF_Fof",  # just add new categories here
-]
+    items = inbox.Items
+    items.Sort("[ReceivedTime]", True)
 
+    now = datetime.datetime.now()
+    for item in items:
+        try:
+            if item.MessageClass.startswith("IPM.Note") and item.UnRead:
+                item.Unread =False
+                item.save()
+        except Exception:
+            pass
+def fetch_otp():
+    """Fetch OTP from latest unread Outlook mail"""
+    outlook = win32com.client.Dispatch("Outlook.Application")
+    namespace = outlook.GetNamespace("MAPI")
+    inbox = namespace.GetDefaultFolder(6)  # Inbox
 
-def login(page):
-    page.goto("https://mfi360.icrainsights.com")
-    page.get_by_role("textbox", name="User ID").click()
-    page.get_by_role("textbox", name="User ID").fill(USER_ID)
-    page.locator("#TxtPwd").fill(USER_PWD)
-    mark_read()
-    page.get_by_role("button", name="LOGIN").click()
+    items = inbox.Items
+    items.Sort("[ReceivedTime]", True)
 
+    now = datetime.datetime.now()
+    for item in items:
+        try:
+            if item.MessageClass.startswith("IPM.Note") and item.UnRead:
+               
 
-def handle_otp(page, browser) -> bool:
-    page.get_by_role("textbox", name="Enter OTP").wait_for()
-    print("Waiting for OTP...")
-    otp = wait_for_otp()
+                # ? Extract 6-digit OTP
+                text = (item.Subject or "") + "\n" + (item.Body or "")
+                match = re.search(r"\b\d{6}\b", text)
+                if match:
+                    otp = match.group(0)
 
-    if not otp:
-        print("OTP not received")
-        browser.close()
-        return False
+                    # ? Mark as read (important)
+                    item.UnRead = False
 
-    print("OTP:", otp)
-    page.get_by_role("textbox", name="Enter OTP").fill(otp)
+                    return otp
+        except Exception:
+            pass
 
-    try:
-        page.get_by_role("button", name="Verify").click()
-    except Exception:
-        pass  # some flows auto-submit after fill
-
-    return True
+    return None
 
 
-def select_scheme_categories(page, search_term: str, categories: list[str]):
-    """
-    Opens 'Select User Set', searches for `search_term`, and clicks
-    every button in `categories`. This replaces the old block of
-    hardcoded .click() calls for Gold ETF_Peer / Tracker / FOF etc.
-    """
-    page.get_by_role("button", name="Select User Set").click()
-    page.get_by_role("textbox", name="Search...").click()
-    page.get_by_role("textbox", name="Search...").fill(search_term)
+def wait_for_otp(timeout=60):
+    """Wait until OTP arrives"""
+    start = time.time()
 
-    for category in categories:
-        page.get_by_role("button", name=category).click()
+    while time.time() - start < timeout:
+        #mark_read()
+        otp = fetch_otp()
+        if otp:
+            return otp
+        time.sleep(5)
 
-
-def navigate_to_report(page, report_link_name: str):
-    page.get_by_role("link", name="Advanced Fund Screener").click()
-    page.get_by_role("link", name="Performance").click()
-    page.get_by_role("link", name="Advanced Return Analysis").click()
-
-    select_scheme_categories(page, SEARCH_TERM, SCHEME_CATEGORIES)
-
-    page.get_by_role("button").nth(2).click()
-    page.get_by_role("link", name=report_link_name, exact=True).click()
-    page.get_by_role("row", name="Scheme Name (0)").locator("fieldset").click()
-
-    page.get_by_role("link", name=report_link_name, exact=True).click()
-    page.get_by_role("checkbox", name="Multiple Tab Output").click()
-    page.get_by_role("button", name="Show Report").click()
+    return None
 
 
-def download_excel(page, download_dir="downloads", filename=None):
-    os.makedirs(download_dir, exist_ok=True)
-
-    with page.expect_download() as download_info:
-        with page.expect_popup() as popup_info:
-            page.get_by_role("link", name="Export to Excel").click()
-        popup_info.value.close()
-
-    download = download_info.value
-    filename = filename or download.suggested_filename
-    path = os.path.join(download_dir, filename)
-    download.save_as(path)
-    print(f"Report downloaded to {path}")
-    return path
-
-
+# ?? Main Automation
+# =========================
 def run(playwright: Playwright):
     browser = playwright.chromium.launch(channel="chrome", headless=False)
     context = browser.new_context()
     page = context.new_page()
 
-    login(page)
+    # -------------------------
+    # ? Step 1: Login page
+    # -------------------------
+    page.goto("https://mfi360.icrainsights.com")
 
-    if not handle_otp(page, browser):
+    page.get_by_role("textbox", name="User ID").click()
+    page.get_by_role("textbox", name="User ID").fill("*")
+
+    page.locator("#TxtPwd").fill("*")
+    mark_read()
+
+    # Click LOGIN ? triggers OTP
+    page.get_by_role("button", name="LOGIN").click()
+
+    # -------------------------
+    # ? Step 2: OTP Handling
+    # -------------------------
+    page.get_by_role("textbox", name="Enter OTP").wait_for()
+
+    print("? Waiting for OTP...")
+    otp = wait_for_otp()
+
+    if not otp:
+        print("? OTP not received")
+        browser.close()
         return
 
-    navigate_to_report(page, REPORT_LINK_NAME)
-    download_excel(page, filename=f"{REPORT_LINK_NAME}_report.xlsx")
+    print("? OTP:", otp)
+
+    page.get_by_role("textbox", name="Enter OTP").fill(otp)
+
+    # If submit button exists, click it
+    try:
+        page.get_by_role("button", name="Verify").click()
+    except:
+        pass  # sometimes auto-submit
+
+    # -------------------------
+    # ? Step 3: After Login Navigation
+    # -------------------------
+    page.get_by_role("link", name="Advanced Fund Screener").click()
+    page.get_by_role("link", name="Performance").click()
+    page.get_by_role("link", name="Advanced Return Analysis").click()   
+    page.get_by_role("button", name="Select User Set").click()
+    page.get_by_role("textbox", name="Search...").click()
+    page.get_by_role("textbox", name="Search...").fill("gold")
+    page.get_by_role("button", name="Gold ETF_Peer").click()
+    page.get_by_role("button", name="Gold ETF_Tracker").click()
+    page.get_by_role("button", name="Gold FOF_Peer").click()
+    page.get_by_role("button", name="Gold FOF_Tracker").click()
+    page.get_by_role("button").nth(2).click()
+    page.get_by_role("link", name="Gold", exact=True).click()
+    page.get_by_role("row", name="Scheme Name (0)").locator("fieldset").click()
+
+    page.get_by_role("link", name="Gold", exact=True).click()
+    page.get_by_role("checkbox", name="Multiple Tab Output").click()
+
+    page.get_by_role("button", name="Show Report").click()
+
+    # -------------------------
+    # ? Step 4: Download Excel
+    # -------------------------
+    with page.expect_download() as download_info:
+        with page.expect_popup() as page1_info:
+            page.get_by_role("link", name="Export to Excel").click()
+
+        page1 = page1_info.value
+        download = download_info.value
+        page1.close()
+
+    print("? Report downloaded")
 
     context.close()
     browser.close()
 
 
+
+# =========================
+
+# =========================
 with sync_playwright() as playwright:
     run(playwright)
