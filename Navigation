@@ -1,160 +1,257 @@
+import os
 import re
 import time
+import logging
 import datetime
+from typing import Optional
+from dataclasses import dataclass
 import win32com.client
-from playwright.sync_api import Playwright, sync_playwright
+from playwright.sync_api import Playwright, Page, sync_playwright
 
-# =========================
-# ? Outlook OTP Fetch
-# =========================
+# Setup logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
-def mark_read():
-    outlook = win32com.client.Dispatch("Outlook.Application")
-    namespace = outlook.GetNamespace("MAPI")
-    inbox = namespace.GetDefaultFolder(6)  # Inbox
 
-    items = inbox.Items
-    items.Sort("[ReceivedTime]", True)
+@dataclass
+class Config:
+    URL: str = "https://mfi360.icrainsights.com"
+    USER_ID: str = os.getenv("MFI360_USER_ID", "*")  # Replace with env vars or secure vault values
+    PASSWORD: str = os.getenv("MFI360_PASSWORD", "*")
+    OTP_TIMEOUT_SEC: int = 60
+    DOWNLOAD_DIR: str = os.getenv("MFI360_DOWNLOAD_DIR", "./downloads")
 
-    now = datetime.datetime.now()
-    for item in items:
-        try:
-            if item.MessageClass.startswith("IPM.Note") and item.UnRead:
-                item.Unread =False
-                item.save()
-        except Exception:
-            pass
-def fetch_otp():
-    """Fetch OTP from latest unread Outlook mail"""
-    outlook = win32com.client.Dispatch("Outlook.Application")
-    namespace = outlook.GetNamespace("MAPI")
-    inbox = namespace.GetDefaultFolder(6)  # Inbox
 
-    items = inbox.Items
-    items.Sort("[ReceivedTime]", True)
+# ==============================================================================
+# 1. Outlook OTP Client
+# ==============================================================================
+class OutlookOTPClient:
+    """Manages Connection to Outlook and extracts OTPs using MAPI restrictions."""
 
-    now = datetime.datetime.now()
-    for item in items:
-        try:
-            if item.MessageClass.startswith("IPM.Note") and item.UnRead:
-               
+    def __init__(self):
+        self._outlook = None
+        self._namespace = None
+        self._inbox = None
 
-                # ? Extract 6-digit OTP
-                text = (item.Subject or "") + "\n" + (item.Body or "")
-                match = re.search(r"\b\d{6}\b", text)
-                if match:
-                    otp = match.group(0)
+    def _connect(self):
+        """Lazy-load the COM connection once to avoid heavy repetitive dispatching."""
+        if not self._inbox:
+            try:
+                self._outlook = win32com.client.Dispatch("Outlook.Application")
+                self._namespace = self._outlook.GetNamespace("MAPI")
+                self._inbox = self._namespace.GetDefaultFolder(6)  # 6 is Inbox
+            except Exception as e:
+                logger.error(f"Failed to connect to Outlook Desktop Application: {e}")
+                raise
+        return self._inbox
 
-                    # ? Mark as read (important)
+    def mark_all_unread_as_read(self) -> None:
+        """Marks all unread notes as read so that we only look at new incoming emails."""
+        inbox = self._connect()
+        # Query unread emails only at the server/API layer
+        unread_items = inbox.Items.Restrict("[Unread] = True")
+        
+        count = 0
+        for item in list(unread_items):  # Convert to list to avoid iteration modifications
+            try:
+                if item.MessageClass.startswith("IPM.Note"):
                     item.UnRead = False
+                    item.Save()
+                    count += 1
+            except Exception:
+                pass
+        if count > 0:
+            logger.info(f"Cleared {count} stale unread email(s) from Inbox.")
 
-                    return otp
+    def fetch_latest_otp(self, otp_pattern: str = r"\b\d{6}\b") -> Optional[str]:
+        """Looks for the most recent unread mail containing a 6-digit OTP."""
+        inbox = self._connect()
+        unread_items = inbox.Items.Restrict("[Unread] = True")
+        unread_items.Sort("[ReceivedTime]", True)  # Ensure newest is first
+
+        for item in unread_items:
+            try:
+                if item.MessageClass.startswith("IPM.Note"):
+                    subject = item.Subject or ""
+                    body = item.Body or ""
+                    text = f"{subject}\n{body}"
+                    
+                    match = re.search(otp_pattern, text)
+                    if match:
+                        otp = match.group(0)
+                        logger.info(f"Found OTP in email: '{subject}'")
+                        item.UnRead = False
+                        item.Save()
+                        return otp
+            except Exception as e:
+                logger.debug(f"Error accessing mail item properties: {e}")
+        return None
+
+    def wait_for_otp(self, timeout_sec: int = 60, poll_interval_sec: int = 5) -> Optional[str]:
+        """Polls Outlook until a new OTP arrives or timeout is reached."""
+        start_time = time.time()
+        logger.info(f"Waiting up to {timeout_sec}s for the OTP email...")
+        
+        while time.time() - start_time < timeout_sec:
+            otp = self.fetch_latest_otp()
+            if otp:
+                return otp
+            time.sleep(poll_interval_sec)
+            
+        logger.warning("OTP fetch timed out.")
+        return None
+
+
+# ==============================================================================
+# 2. Page Object Model (POM) Classes
+# ==============================================================================
+class MFI360LoginPage:
+    """Encapsulates login page actions and verification."""
+
+    def __init__(self, page: Page):
+        self.page = page
+        self._user_id_input = page.get_by_role("textbox", name="User ID")
+        self._password_input = page.locator("#TxtPwd")
+        self._login_button = page.get_by_role("button", name="LOGIN")
+        self._otp_input = page.get_by_role("textbox", name="Enter OTP")
+        self._verify_button = page.get_by_role("button", name="Verify")
+
+    def navigate(self, url: str) -> None:
+        logger.info(f"Navigating to {url}...")
+        self.page.goto(url)
+
+    def enter_credentials(self, user_id: str, password: str) -> None:
+        logger.info("Entering login credentials...")
+        self._user_id_input.fill(user_id)
+        self._password_input.fill(password)
+
+    def click_login(self) -> None:
+        logger.info("Clicking the login button...")
+        self._login_button.click()
+
+    def submit_otp(self, otp: str) -> None:
+        logger.info("Entering OTP...")
+        self._otp_input.wait_for()
+        self._otp_input.fill(otp)
+
+        # Some pages auto-submit, check if Verify button is still visible and active
+        try:
+            if self._verify_button.is_visible(timeout=3000):
+                self._verify_button.click()
+                logger.info("Clicked the Verify button.")
         except Exception:
-            pass
-
-    return None
+            logger.info("Verify button not found or was auto-submitted.")
 
 
-def wait_for_otp(timeout=60):
-    """Wait until OTP arrives"""
-    start = time.time()
+class MFI360ScreenerPage:
+    """Encapsulates post-login dashboard configuration and Excel download."""
 
-    while time.time() - start < timeout:
-        #mark_read()
-        otp = fetch_otp()
-        if otp:
-            return otp
-        time.sleep(5)
+    def __init__(self, page: Page):
+        self.page = page
 
-    return None
+    def configure_report(self) -> None:
+        logger.info("Configuring report preferences...")
+        
+        # 1. Navigation Flow
+        self.page.get_by_role("link", name="Advanced Fund Screener").click()
+        self.page.get_by_role("link", name="Performance").click()
+        self.page.get_by_role("link", name="Advanced Return Analysis").click()
+        
+        # 2. Select User Set and Search
+        self.page.get_by_role("button", name="Select User Set").click()
+        self.page.get_by_role("textbox", name="Search...").fill("gold")
+
+        # 3. Peer group selection
+        self.page.get_by_role("button", name="Gold ETF_Peer").click()
+        self.page.get_by_role("button", name="Gold ETF_Tracker").click()
+        self.page.get_by_role("button", name="Gold FOF_Peer").click()
+        self.page.get_by_role("button", name="Gold FOF_Tracker").click()
+
+        # Brittle selector warning: Using .nth(2) index is fragile.
+        # Ideally, inspect the button's class or title (e.g., page.get_by_role("button", name="Close"))
+        self.page.get_by_role("button").nth(2).click()
+
+        # 4. Filters & Checkbox output
+        self.page.get_by_role("link", name="Gold", exact=True).click()
+        self.page.get_by_role("row", name="Scheme Name (0)").locator("fieldset").click()
+        self.page.get_by_role("link", name="Gold", exact=True).click()
+        
+        # Use .check() for checkboxes instead of generic .click()
+        self.page.get_by_role("checkbox", name="Multiple Tab Output").check()
+
+    def export_excel(self) -> str:
+        """Triggers report generation, intercepts the download, and saves it locally."""
+        logger.info("Generating report...")
+        self.page.get_by_role("button", name="Show Report").click()
+
+        logger.info("Starting Excel export...")
+        with self.page.expect_download() as download_info:
+            self.page.get_by_role("link", name="Export to Excel").click()
+
+        download = download_info.value
+        save_path = os.path.join(Config.DOWNLOAD_DIR, download.suggested_filename)
+        
+        # Save the download to a permanent folder
+        download.save_as(save_path)
+        logger.info(f"Excel report saved successfully to: {save_path}")
+        return save_path
 
 
-# ?? Main Automation
-# =========================
-def run(playwright: Playwright):
-    browser = playwright.chromium.launch(channel="chrome", headless=False)
+# ==============================================================================
+# 3. Main Execution Workflow
+# ==============================================================================
+def run(playwright: Playwright) -> None:
+    # Ensure download target folder exists
+    os.makedirs(Config.DOWNLOAD_DIR, exist_ok=True)
+    
+    # Launch browser (uses system chrome but falls back to chromium if not found)
+    logger.info("Initializing browser session...")
+    try:
+        browser = playwright.chromium.launch(channel="chrome", headless=False)
+    except Exception:
+        logger.warning("System Chrome not found. Falling back to default Chromium binary.")
+        browser = playwright.chromium.launch(headless=False)
+        
     context = browser.new_context()
     page = context.new_page()
 
-    # -------------------------
-    # ? Step 1: Login page
-    # -------------------------
-    page.goto("https://mfi360.icrainsights.com")
+    # Initialize components
+    outlook_client = OutlookOTPClient()
+    login_page = MFI360LoginPage(page)
+    screener_page = MFI360ScreenerPage(page)
 
-    page.get_by_role("textbox", name="User ID").click()
-    page.get_by_role("textbox", name="User ID").fill("*")
-
-    page.locator("#TxtPwd").fill("*")
-    mark_read()
-
-    # Click LOGIN ? triggers OTP
-    page.get_by_role("button", name="LOGIN").click()
-
-    # -------------------------
-    # ? Step 2: OTP Handling
-    # -------------------------
-    page.get_by_role("textbox", name="Enter OTP").wait_for()
-
-    print("? Waiting for OTP...")
-    otp = wait_for_otp()
-
-    if not otp:
-        print("? OTP not received")
-        browser.close()
-        return
-
-    print("? OTP:", otp)
-
-    page.get_by_role("textbox", name="Enter OTP").fill(otp)
-
-    # If submit button exists, click it
     try:
-        page.get_by_role("button", name="Verify").click()
-    except:
-        pass  # sometimes auto-submit
+        # Step 1: Nav & Prep
+        login_page.navigate(Config.URL)
+        login_page.enter_credentials(Config.USER_ID, Config.PASSWORD)
 
-    # -------------------------
-    # ? Step 3: After Login Navigation
-    # -------------------------
-    page.get_by_role("link", name="Advanced Fund Screener").click()
-    page.get_by_role("link", name="Performance").click()
-    page.get_by_role("link", name="Advanced Return Analysis").click()   
-    page.get_by_role("button", name="Select User Set").click()
-    page.get_by_role("textbox", name="Search...").click()
-    page.get_by_role("textbox", name="Search...").fill("gold")
-    page.get_by_role("button", name="Gold ETF_Peer").click()
-    page.get_by_role("button", name="Gold ETF_Tracker").click()
-    page.get_by_role("button", name="Gold FOF_Peer").click()
-    page.get_by_role("button", name="Gold FOF_Tracker").click()
-    page.get_by_role("button").nth(2).click()
-    page.get_by_role("link", name="Gold", exact=True).click()
-    page.get_by_role("row", name="Scheme Name (0)").locator("fieldset").click()
+        # Clear old OTPs to prevent matching historic emails
+        outlook_client.mark_all_unread_as_read()
 
-    page.get_by_role("link", name="Gold", exact=True).click()
-    page.get_by_role("checkbox", name="Multiple Tab Output").click()
+        # Step 2: Trigger and Handle OTP
+        login_page.click_login()
+        otp = outlook_client.wait_for_otp(timeout_sec=Config.OTP_TIMEOUT_SEC)
 
-    page.get_by_role("button", name="Show Report").click()
+        if not otp:
+            logger.error("Process aborted: OTP not received.")
+            return
 
-    # -------------------------
-    # ? Step 4: Download Excel
-    # -------------------------
-    with page.expect_download() as download_info:
-        with page.expect_popup() as page1_info:
-            page.get_by_role("link", name="Export to Excel").click()
+        login_page.submit_otp(otp)
 
-        page1 = page1_info.value
-        download = download_info.value
-        page1.close()
+        # Step 3: Screen Gold ETFs / FOFs
+        screener_page.configure_report()
 
-    print("? Report downloaded")
+        # Step 4: Download Report
+        screener_page.export_excel()
 
-    context.close()
-    browser.close()
+    except Exception as e:
+        logger.exception(f"An unexpected error occurred during execution: {e}")
+    finally:
+        logger.info("Cleaning up browser context.")
+        context.close()
+        browser.close()
 
 
-
-# =========================
-
-# =========================
-with sync_playwright() as playwright:
-    run(playwright)
+if __name__ == "__main__":
+    with sync_playwright() as playwright:
+        run(playwright)
