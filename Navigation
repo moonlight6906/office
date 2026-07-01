@@ -1,0 +1,121 @@
+import os
+from playwright.sync_api import Playwright, sync_playwright
+from dotenv import load_dotenv
+
+# Loads ICRA_USER_ID / ICRA_USER_PWD from a local .env file
+# (never commit the .env file to git)
+load_dotenv()
+
+USER_ID = os.environ["ICRA_USER_ID"]
+USER_PWD = os.environ["ICRA_USER_PWD"]
+
+# ---------------------------------------------------------
+# Everything that changes between runs lives here.
+# Add/remove a category -> nothing else in the script changes.
+# ---------------------------------------------------------
+SEARCH_TERM = "gold"          # typed into the "Select User Set" search box
+REPORT_LINK_NAME = "Gold"     # the fund-group link/report to open
+SCHEME_CATEGORIES = [
+    "Gold ETF_Peer",
+    "Gold ETF_Tracker",
+    "Gold FOF_Peer",
+    "Gold FOF_Tracker",
+    # "Gold ETF_Fof",  # just add new categories here
+]
+
+
+def login(page):
+    page.goto("https://mfi360.icrainsights.com")
+    page.get_by_role("textbox", name="User ID").click()
+    page.get_by_role("textbox", name="User ID").fill(USER_ID)
+    page.locator("#TxtPwd").fill(USER_PWD)
+    mark_read()
+    page.get_by_role("button", name="LOGIN").click()
+
+
+def handle_otp(page, browser) -> bool:
+    page.get_by_role("textbox", name="Enter OTP").wait_for()
+    print("Waiting for OTP...")
+    otp = wait_for_otp()
+
+    if not otp:
+        print("OTP not received")
+        browser.close()
+        return False
+
+    print("OTP:", otp)
+    page.get_by_role("textbox", name="Enter OTP").fill(otp)
+
+    try:
+        page.get_by_role("button", name="Verify").click()
+    except Exception:
+        pass  # some flows auto-submit after fill
+
+    return True
+
+
+def select_scheme_categories(page, search_term: str, categories: list[str]):
+    """
+    Opens 'Select User Set', searches for `search_term`, and clicks
+    every button in `categories`. This replaces the old block of
+    hardcoded .click() calls for Gold ETF_Peer / Tracker / FOF etc.
+    """
+    page.get_by_role("button", name="Select User Set").click()
+    page.get_by_role("textbox", name="Search...").click()
+    page.get_by_role("textbox", name="Search...").fill(search_term)
+
+    for category in categories:
+        page.get_by_role("button", name=category).click()
+
+
+def navigate_to_report(page, report_link_name: str):
+    page.get_by_role("link", name="Advanced Fund Screener").click()
+    page.get_by_role("link", name="Performance").click()
+    page.get_by_role("link", name="Advanced Return Analysis").click()
+
+    select_scheme_categories(page, SEARCH_TERM, SCHEME_CATEGORIES)
+
+    page.get_by_role("button").nth(2).click()
+    page.get_by_role("link", name=report_link_name, exact=True).click()
+    page.get_by_role("row", name="Scheme Name (0)").locator("fieldset").click()
+
+    page.get_by_role("link", name=report_link_name, exact=True).click()
+    page.get_by_role("checkbox", name="Multiple Tab Output").click()
+    page.get_by_role("button", name="Show Report").click()
+
+
+def download_excel(page, download_dir="downloads", filename=None):
+    os.makedirs(download_dir, exist_ok=True)
+
+    with page.expect_download() as download_info:
+        with page.expect_popup() as popup_info:
+            page.get_by_role("link", name="Export to Excel").click()
+        popup_info.value.close()
+
+    download = download_info.value
+    filename = filename or download.suggested_filename
+    path = os.path.join(download_dir, filename)
+    download.save_as(path)
+    print(f"Report downloaded to {path}")
+    return path
+
+
+def run(playwright: Playwright):
+    browser = playwright.chromium.launch(channel="chrome", headless=False)
+    context = browser.new_context()
+    page = context.new_page()
+
+    login(page)
+
+    if not handle_otp(page, browser):
+        return
+
+    navigate_to_report(page, REPORT_LINK_NAME)
+    download_excel(page, filename=f"{REPORT_LINK_NAME}_report.xlsx")
+
+    context.close()
+    browser.close()
+
+
+with sync_playwright() as playwright:
+    run(playwright)
